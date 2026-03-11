@@ -1404,6 +1404,88 @@ class Hy3DVAEDecode:
         
         return (mesh_output, )
 
+def _smooth_mesh_normals(mesh):
+    mesh.vertex_normals = Trimesh.smoothing.get_vertices_normals(mesh)
+    return mesh
+
+
+def _postprocess_mesh(mesh, remove_floaters, remove_degenerate_faces, reduce_faces, max_facenum, smooth_normals):
+    new_mesh = mesh.copy()
+    if remove_floaters:
+        new_mesh = FloaterRemover()(new_mesh)
+        log.info(f"Removed floaters, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
+    if remove_degenerate_faces:
+        new_mesh = DegenerateFaceRemover()(new_mesh)
+        log.info(f"Removed degenerate faces, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
+    if reduce_faces:
+        new_mesh = FaceReducer()(new_mesh, max_facenum=max_facenum)
+        log.info(f"Reduced faces, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
+    if smooth_normals:
+        new_mesh = _smooth_mesh_normals(new_mesh)
+    return new_mesh
+
+
+def _fast_simplify_mesh(mesh, target_count, aggressiveness, preserve_border, max_iterations, lossless, threshold_lossless, update_rate):
+    try:
+        import pyfqmr
+    except ImportError:
+        raise ImportError("pyfqmr not found. Please install it using 'pip install pyfqmr' https://github.com/Kramer84/pyfqmr-Fast-Quadric-Mesh-Reduction")
+
+    mesh_simplifier = pyfqmr.Simplify()
+    mesh_simplifier.setMesh(mesh.vertices, mesh.faces)
+    mesh_simplifier.simplify_mesh(
+        target_count=target_count,
+        aggressiveness=aggressiveness,
+        update_rate=update_rate,
+        max_iterations=max_iterations,
+        preserve_border=preserve_border,
+        verbose=True,
+        lossless=lossless,
+        threshold_lossless=threshold_lossless
+    )
+    new_vertices, new_faces, _ = mesh_simplifier.getMesh()
+    new_mesh = Trimesh.Trimesh(new_vertices, new_faces, process=False)
+    log.info(
+        f"Simplified mesh toward {target_count} triangles, resulting in "
+        f"{new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces"
+    )
+    return new_mesh
+
+
+def _instant_remesh_mesh(mesh, merge_vertices, vertex_count, smooth_iter, align_to_boundaries, triangulate_result, max_facenum=None):
+    try:
+        import pynanoinstantmeshes as PyNIM
+    except ImportError:
+        raise ImportError("pynanoinstantmeshes not found. Please install it using 'pip install pynanoinstantmeshes'")
+
+    working_mesh = mesh.copy()
+    if merge_vertices:
+        working_mesh.merge_vertices()
+
+    new_verts, new_faces = PyNIM.remesh(
+        np.array(working_mesh.vertices, dtype=np.float32),
+        np.array(working_mesh.faces, dtype=np.uint32),
+        vertex_count,
+        align_to_boundaries=align_to_boundaries,
+        smooth_iter=smooth_iter
+    )
+    if new_verts.size == 0 or new_faces.size == 0:
+        raise ValueError("Instant-meshes returned an empty mesh")
+    if new_faces.max() >= new_verts.shape[0] or new_faces.min() < 0:
+        raise ValueError("Instant-meshes failed to remesh the mesh")
+
+    new_verts = new_verts.astype(np.float32)
+    if triangulate_result and new_faces.ndim == 2 and new_faces.shape[1] == 4:
+        new_faces = Trimesh.geometry.triangulate_quads(new_faces)
+
+    new_mesh = Trimesh.Trimesh(new_verts, new_faces.astype(np.int64), process=False)
+    if max_facenum is not None and len(new_mesh.faces) > max_facenum:
+        new_mesh = FaceReducer()(new_mesh, max_facenum=max_facenum)
+
+    log.info(f"Instant-remeshed mesh to {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
+    return new_mesh
+
+
 class Hy3DPostprocessMesh:
     @classmethod
     def INPUT_TYPES(s):
@@ -1424,20 +1506,14 @@ class Hy3DPostprocessMesh:
     CATEGORY = "Hunyuan3DWrapper"
 
     def process(self, trimesh, remove_floaters, remove_degenerate_faces, reduce_faces, max_facenum, smooth_normals):
-        new_mesh = trimesh.copy()
-        if remove_floaters:
-            new_mesh = FloaterRemover()(new_mesh)
-            log.info(f"Removed floaters, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
-        if remove_degenerate_faces:
-            new_mesh = DegenerateFaceRemover()(new_mesh)
-            log.info(f"Removed degenerate faces, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
-        if reduce_faces:
-            new_mesh = FaceReducer()(new_mesh, max_facenum=max_facenum)
-            log.info(f"Reduced faces, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
-        if smooth_normals:              
-            new_mesh.vertex_normals = Trimesh.smoothing.get_vertices_normals(new_mesh)
-
-        
+        new_mesh = _postprocess_mesh(
+            trimesh,
+            remove_floaters=remove_floaters,
+            remove_degenerate_faces=remove_degenerate_faces,
+            reduce_faces=reduce_faces,
+            max_facenum=max_facenum,
+            smooth_normals=smooth_normals,
+        )
         return (new_mesh, )
 
 class Hy3DFastSimplifyMesh:
@@ -1463,27 +1539,16 @@ class Hy3DFastSimplifyMesh:
     DESCRIPTION = "Simplifies the mesh using Fast Quadric Mesh Reduction: https://github.com/Kramer84/pyfqmr-Fast-Quadric-Mesh-Reduction"
 
     def process(self, trimesh, target_count, aggressiveness, preserve_border, max_iterations,lossless, threshold_lossless, update_rate):
-        new_mesh = trimesh.copy()
-        try:
-            import pyfqmr
-        except ImportError:
-            raise ImportError("pyfqmr not found. Please install it using 'pip install pyfqmr' https://github.com/Kramer84/pyfqmr-Fast-Quadric-Mesh-Reduction")
-        
-        mesh_simplifier = pyfqmr.Simplify()
-        mesh_simplifier.setMesh(trimesh.vertices, trimesh.faces)
-        mesh_simplifier.simplify_mesh(
-            target_count=target_count, 
+        new_mesh = _fast_simplify_mesh(
+            trimesh,
+            target_count=target_count,
             aggressiveness=aggressiveness,
-            update_rate=update_rate,
+            preserve_border=preserve_border,
             max_iterations=max_iterations,
-            preserve_border=preserve_border, 
-            verbose=True,
             lossless=lossless,
-            threshold_lossless=threshold_lossless
-            )
-        new_mesh.vertices, new_mesh.faces, _ = mesh_simplifier.getMesh()
-        log.info(f"Simplified mesh to {target_count} vertices, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")   
-        
+            threshold_lossless=threshold_lossless,
+            update_rate=update_rate,
+        )
         return (new_mesh, )
     
 class Hy3DMeshInfo:
@@ -1531,30 +1596,119 @@ class Hy3DIMRemesh:
     DESCRIPTION = "Remeshes the mesh using instant-meshes: https://github.com/wjakob/instant-meshes, Note: this will remove all vertex colors and textures."
 
     def remesh(self, trimesh, merge_vertices, vertex_count, smooth_iter, align_to_boundaries, triangulate_result, max_facenum):
-        try:
-            import pynanoinstantmeshes as PyNIM
-        except ImportError:
-            raise ImportError("pynanoinstantmeshes not found. Please install it using 'pip install pynanoinstantmeshes'")
-        new_mesh = trimesh.copy()
-        if merge_vertices:
-            trimesh.merge_vertices(new_mesh)
-
-        new_verts, new_faces = PyNIM.remesh(
-            np.array(trimesh.vertices, dtype=np.float32),
-            np.array(trimesh.faces, dtype=np.uint32),
-            vertex_count,
+        new_mesh = _instant_remesh_mesh(
+            trimesh,
+            merge_vertices=merge_vertices,
+            vertex_count=vertex_count,
+            smooth_iter=smooth_iter,
             align_to_boundaries=align_to_boundaries,
-            smooth_iter=smooth_iter
+            triangulate_result=triangulate_result,
+            max_facenum=max_facenum,
         )
-        if new_verts.shape[0] - 1 != new_faces.max():
-            # Skip test as the meshing failed
-            raise ValueError("Instant-meshes failed to remesh the mesh")
-        new_verts = new_verts.astype(np.float32)
-        if triangulate_result:
-            new_faces = Trimesh.geometry.triangulate_quads(new_faces)
-        
-        if len(new_mesh.faces) > max_facenum:
-            new_mesh = FaceReducer()(new_mesh, max_facenum=max_facenum)
+        return (new_mesh, )
+
+
+class Hy3DOptimizeMesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh": ("TRIMESH",),
+                "remove_floaters": ("BOOLEAN", {"default": True}),
+                "remove_degenerate_faces": ("BOOLEAN", {"default": True}),
+                "merge_vertices": ("BOOLEAN", {"default": True}),
+                "use_instant_remesh": ("BOOLEAN", {"default": True}),
+                "remesh_vertex_count": ("INT", {"default": 10000, "min": 100, "max": 10000000, "step": 1, "tooltip": "Target number of vertices for Instant-Meshes"}),
+                "remesh_smooth_iter": ("INT", {"default": 8, "min": 0, "max": 100, "step": 1}),
+                "align_to_boundaries": ("BOOLEAN", {"default": True}),
+                "triangulate_result": ("BOOLEAN", {"default": True}),
+                "use_fast_simplify": ("BOOLEAN", {"default": True}),
+                "simplify_target_count": ("INT", {"default": 8000, "min": 1, "max": 100000000, "step": 1, "tooltip": "Target number of triangles for Fast Simplify"}),
+                "aggressiveness": ("INT", {"default": 7, "min": 0, "max": 100, "step": 1}),
+                "max_iterations": ("INT", {"default": 100, "min": 1, "max": 1000, "step": 1}),
+                "update_rate": ("INT", {"default": 5, "min": 1, "max": 1000, "step": 1}),
+                "preserve_border": ("BOOLEAN", {"default": True}),
+                "lossless": ("BOOLEAN", {"default": False}),
+                "threshold_lossless": ("FLOAT", {"default": 1e-3, "min": 0.0, "max": 1.0, "step": 0.0001}),
+                "final_reduce_faces": ("BOOLEAN", {"default": True}),
+                "final_max_facenum": ("INT", {"default": 8000, "min": 1, "max": 10000000, "step": 1, "tooltip": "Hard face cap applied after remesh and simplification"}),
+                "smooth_normals": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("TRIMESH",)
+    RETURN_NAMES = ("trimesh",)
+    FUNCTION = "optimize"
+    CATEGORY = "Hunyuan3DWrapper"
+    DESCRIPTION = "Unified mesh optimization pipeline: cleanup, Instant-Meshes remesh, Fast Simplify, and final face reduction. Remeshing and simplification can discard colors/textures."
+
+    def optimize(
+        self,
+        trimesh,
+        remove_floaters,
+        remove_degenerate_faces,
+        merge_vertices,
+        use_instant_remesh,
+        remesh_vertex_count,
+        remesh_smooth_iter,
+        align_to_boundaries,
+        triangulate_result,
+        use_fast_simplify,
+        simplify_target_count,
+        aggressiveness,
+        max_iterations,
+        update_rate,
+        preserve_border,
+        lossless,
+        threshold_lossless,
+        final_reduce_faces,
+        final_max_facenum,
+        smooth_normals,
+    ):
+        new_mesh = _postprocess_mesh(
+            trimesh,
+            remove_floaters=remove_floaters,
+            remove_degenerate_faces=remove_degenerate_faces,
+            reduce_faces=False,
+            max_facenum=final_max_facenum,
+            smooth_normals=False,
+        )
+
+        if use_instant_remesh:
+            new_mesh = _instant_remesh_mesh(
+                new_mesh,
+                merge_vertices=merge_vertices,
+                vertex_count=remesh_vertex_count,
+                smooth_iter=remesh_smooth_iter,
+                align_to_boundaries=align_to_boundaries,
+                triangulate_result=triangulate_result,
+                max_facenum=None,
+            )
+        elif merge_vertices:
+            new_mesh = new_mesh.copy()
+            new_mesh.merge_vertices()
+
+        if use_fast_simplify:
+            new_mesh = _fast_simplify_mesh(
+                new_mesh,
+                target_count=simplify_target_count,
+                aggressiveness=aggressiveness,
+                preserve_border=preserve_border,
+                max_iterations=max_iterations,
+                lossless=lossless,
+                threshold_lossless=threshold_lossless,
+                update_rate=update_rate,
+            )
+
+        if final_reduce_faces or smooth_normals:
+            new_mesh = _postprocess_mesh(
+                new_mesh,
+                remove_floaters=False,
+                remove_degenerate_faces=False,
+                reduce_faces=final_reduce_faces,
+                max_facenum=final_max_facenum,
+                smooth_normals=smooth_normals,
+            )
 
         return (new_mesh, )
     
@@ -1909,6 +2063,7 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DRenderSingleView": Hy3DRenderSingleView,
     "Hy3DDiffusersSchedulerConfig": Hy3DDiffusersSchedulerConfig,
     "Hy3DIMRemesh": Hy3DIMRemesh,
+    "Hy3DOptimizeMesh": Hy3DOptimizeMesh,
     "Hy3DBPT": Hy3DBPT,
     "Hy3DMeshInfo": Hy3DMeshInfo,
     "Hy3DFastSimplifyMesh": Hy3DFastSimplifyMesh,
@@ -1947,6 +2102,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DRenderSingleView": "Hy3D Render SingleView",
     "Hy3DDiffusersSchedulerConfig": "Hy3D Diffusers Scheduler Config",
     "Hy3DIMRemesh": "Hy3D Instant-Meshes Remesh",
+    "Hy3DOptimizeMesh": "Hy3D Optimize Mesh",
     "Hy3DBPT": "Hy3D BPT",
     "Hy3DMeshInfo": "Hy3D Mesh Info",
     "Hy3DFastSimplifyMesh": "Hy3D Fast Simplify Mesh",

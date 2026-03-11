@@ -18,8 +18,13 @@ custom_rasterizer_module = CUDAExtension('custom_rasterizer_kernel', [
     'lib/custom_rasterizer_kernel/grid_neighbor.cpp',
     'lib/custom_rasterizer_kernel/rasterizer_gpu.cu',
 ], extra_compile_args={
-    'cxx': [],
-    'nvcc': ['-Xcompiler', '/Zc:preprocessor'],
+    'cxx': ['/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH'],
+    'nvcc': [
+        '-Xcompiler', '/Zc:preprocessor',
+        '-allow-unsupported-compiler',
+        '-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH',
+        '-cudart=static',
+    ],
 })
 
 setup(
